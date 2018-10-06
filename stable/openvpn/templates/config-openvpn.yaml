@@ -1,0 +1,188 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ template "openvpn.fullname" . }}
+  labels:
+    app: {{ template "openvpn.name" . }}
+    chart: {{ template "openvpn.chart" . }}
+    release: {{ .Release.Name }}
+    heritage: {{ .Release.Service }}
+data:
+  setup-certs.sh: |-
+    #!/bin/bash
+    EASY_RSA_LOC="/etc/openvpn/certs"
+    SERVER_CERT="${EASY_RSA_LOC}/pki/issued/server.crt"
+    if [ -e "$SERVER_CERT" ]
+    then
+      echo "found existing certs - reusing"
+    else
+      cp -R /usr/share/easy-rsa/3/* $EASY_RSA_LOC
+      cd $EASY_RSA_LOC
+      ./easyrsa init-pki
+      echo "ca\n" | ./easyrsa build-ca nopass
+      ./easyrsa build-server-full server nopass
+      ./easyrsa gen-dh
+    fi
+  newClientConfig.sh: |-
+      #!/bin/bash
+      EASY_RSA_LOC="/etc/openvpn/certs"
+      CERTS_DIR="/etc/openvpn/certs"
+      KEY_NAME="$1"
+      # MY_IP_ADDR="$2"
+      cd $EASY_RSA_LOC
+      ./easyrsa build-client-full $1 nopass
+      cat >/etc/openvpn/$KEY_NAME.ovpn <<EOF
+      client
+      nobind
+      dev tun
+      remote {{ .Values.openvpn.OVPN_DNS_NAME }} 443
+      proto {{ .Values.openvpn.OVPN_PROTO }}
+
+      resolv-retry infinite
+      reneg-sec 0
+      key-direction 1
+      auth-user-pass
+      auth-nocache
+
+      {{- if .Values.openvpn.redirectGateway }}
+      redirect-gateway def1
+      {{- end }}
+      tls-client
+      <key>
+      `cat ${EASY_RSA_LOC}/pki/private/$KEY_NAME.key`
+      </key>
+      <cert>
+      `cat ${EASY_RSA_LOC}/pki/issued/$KEY_NAME.crt`
+      </cert>
+      <ca>
+      `cat ${EASY_RSA_LOC}/pki/ca.crt`
+      </ca>
+      EOF
+
+      cat $KEY_NAME.ovpn
+  configure.sh: |-
+      #!/bin/sh
+      /etc/openvpn/setup/setup-certs.sh
+      iptables -t nat -A POSTROUTING -s {{ .Values.openvpn.OVPN_NETWORK }}/{{ .Values.openvpn.OVPN_SUBNET }} -o eth0 -j MASQUERADE
+      mkdir -p /dev/net
+      if [ ! -c /dev/net/tun ]; then
+          mknod /dev/net/tun c 10 200
+      fi
+
+      if [ "$DEBUG" == "1" ]; then
+          echo ========== ${OVPN_CONFIG} ==========
+          cat "${OVPN_CONFIG}"
+          echo ====================================
+      fi
+      # this command came from the upstream and gives me 0, the value of the last field. we want an ip address.
+      # IP=$(ip route get 8.8.8.8 | awk '/8.8.8.8/ {print $NF}')
+      IP=$(hostname -I | cut -d" " -f 1)
+      BASEIP=`echo $IP | cut -d"." -f1-3`
+      NETWORK=`echo $BASEIP".0"`
+      DNS=$(cat /etc/resolv.conf | grep -v '^#' | grep nameserver | awk '{print $2}')
+      SEARCH=$(cat /etc/resolv.conf | grep -v '^#' | grep search | awk '{$1=""; print $0}')
+      FORMATTED_SEARCH=""
+      for DOMAIN in $SEARCH; do
+        FORMATTED_SEARCH="${FORMATTED_SEARCH}push \"dhcp-option DOMAIN-SEARCH ${DOMAIN}\"\n"
+      done
+      cp -f /etc/openvpn/setup/openvpn.conf /etc/openvpn/
+      sed 's|OVPN_K8S_SEARCH|'"${FORMATTED_SEARCH}"'|' -i /etc/openvpn/openvpn.conf
+      sed 's|OVPN_K8S_DNS|'"${DNS}"'|' -i /etc/openvpn/openvpn.conf
+      sed 's|NETWORK|'"${NETWORK}"'|' -i /etc/openvpn/openvpn.conf
+
+      BINDDN=$(cat /etc/openvpn/auth/credentials/bind-dn)
+      BINDPW=$(cat /etc/openvpn/auth/credentials/bind-pw)
+      cp -f /etc/openvpn/setup/ldap.conf /etc/openvpn/auth/
+      sed 's|OVPN_K8S_BINDDN|'"${BINDDN}"'|' -i /etc/openvpn/auth/ldap.conf
+      sed 's|OVPN_K8S_BINDPW|'"${BINDPW}"'|' -i /etc/openvpn/auth/ldap.conf
+      # this newline at the end of the ldap conf is critical. Seriously, the 
+      # damn thing seg faults without it.
+      echo "" >> /etc/openvpn/auth/ldap.conf
+
+      openvpn --config /etc/openvpn/openvpn.conf
+  ldap.conf: |-
+      <LDAP>
+        # LDAP server URL
+        URL  "{{ .Values.openvpn.ldap.url }}"
+
+        # Bind DN (If your LDAP server doesn't support anonymous binds)
+        BindDN  "OVPN_K8S_BINDDN"
+
+        # Bind Password
+        Password  "OVPN_K8S_BINDPW"
+
+        # Network timeout (in seconds)
+        Timeout  15
+
+        # Enable Start TLS
+        TLSEnable  no
+
+        # Follow LDAP Referrals (anonymously)
+        FollowReferrals  yes
+      </LDAP>
+      <Authorization>
+        # Base DN
+        BaseDN  "{{ .Values.openvpn.ldap.baseDN }}"
+
+        # User Search Filter
+        SearchFilter  "{{ .Values.openvpn.ldap.searchFilter }}"
+
+        # Require Group Membership
+        RequireGroup  false
+      </Authorization>
+  openvpn.conf: |-
+      server {{ .Values.openvpn.OVPN_NETWORK }} {{ .Values.openvpn.OVPN_SUBNET }}
+      verb 3
+
+      tls-server
+      key /etc/openvpn/certs/pki/private/server.key
+      ca /etc/openvpn/certs/pki/ca.crt
+      cert /etc/openvpn/certs/pki/issued/server.crt
+      dh /etc/openvpn/certs/pki/dh.pem
+      key-direction 0
+      keepalive 10 60
+
+      proto {{ .Values.openvpn.OVPN_PROTO }}
+      port  {{ .Values.service.internalPort }}
+      dev tun0
+      status /var/openvpn-status/status.log
+      status-version 2
+      
+      # It's a good idea to reduce the OpenVPN
+      # daemon's privileges after initialization.
+      user nobody
+      group nobody
+
+      # The persist options will try to avoid
+      # accessing certain resources on restart
+      # that may no longer be accessible because
+      # of the privilege downgrade.
+      persist-key
+      persist-tun
+{{ if .Values.openvpn.ldap.enabled }}
+      # Activate LDAP authentication.
+      plugin /usr/lib64/openvpn/plugin/lib/openvpn-auth-ldap.so /etc/openvpn/auth/ldap.conf
+      # Disable client certificates since we are using LDAP authentication now.
+      # verify-client-cert none
+{{ end }}
+      # NOTE: this route was in the k8s chart but i think because our vpn server
+      #       is in the range of OVPN_K8S_POD_NETWORK/SUBNET we don't need it
+      # push "route NETWORK 255.255.240.0"
+{{ if (.Values.openvpn.OVPN_K8S_POD_NETWORK) (.Values.openvpn.OVPN_K8S_POD_SUBNET) }}
+      push "route {{ .Values.openvpn.OVPN_K8S_POD_NETWORK }} {{ .Values.openvpn.OVPN_K8S_POD_SUBNET }}"
+{{ end }}
+{{ if (.Values.openvpn.OVPN_K8S_CLUSTER_IP_NETWORK) (.Values.openvpn.OVPN_K8S_CLUSTER_IP_SUBNET) }}
+      push "route {{ .Values.openvpn.OVPN_K8S_CLUSTER_IP_NETWORK }} {{ .Values.openvpn.OVPN_K8S_CLUSTER_IP_SUBNET }}"
+{{ end }}
+{{ if (.Values.openvpn.OVPN_K8S_NODE_NETWORK) (.Values.openvpn.OVPN_K8S_NODE_SUBNET) }}
+      push "route {{ .Values.openvpn.OVPN_K8S_NODE_NETWORK }} {{ .Values.openvpn.OVPN_K8S_NODE_SUBNET }}"
+{{ end }}
+
+{{ if .Values.openvpn.dhcpOptionDomain }}
+      OVPN_K8S_SEARCH
+{{ end }}
+      push "dhcp-option DNS OVPN_K8S_DNS"
+
+      {{- if .Values.openvpn.conf }}
+{{ indent 6 .Values.openvpn.conf }}
+      {{- end -}}

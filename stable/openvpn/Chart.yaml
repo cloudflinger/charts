@@ -1,0 +1,20 @@
+apiVersion: v1
+description: A Helm chart to install an openvpn server inside a kubernetes cluster. Bring your own certs. Supports LDAP auth plugin
+name: openvpn
+version: 2.5.0
+appVersion: 2.5.0
+maintainers:
+- name: jake
+  email: jake@cloudflinger.com
+icon: https://forums.openvpn.net/styles/openvpn/theme/images/ovpnlogo.png
+keywords:
+- openvpn
+- vpn
+- tunnel
+- network
+- service
+- connectivity
+- encryption
+- ldap
+home: https://openvpn.net/index.php/open-source.html
+sources: []
